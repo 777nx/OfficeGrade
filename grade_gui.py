@@ -44,10 +44,19 @@ from grade_exam import (  # noqa: E402
     AUTHOR,
     APP_TITLE,
     TEACHER_CLASSES,
+    GradeRow,
     app_dir,
+    deduction_stats,
     grade_all,
+    load_typing_answer_text,
+    precheck_submissions,
+    regrade_one_in_rows,
     resource_dir,
+    save_rows,
     self_check,
+    suggest_output_path,
+    unpack_submission_zip,
+    unique_output_path,
 )
 
 
@@ -89,12 +98,17 @@ class GradeApp:
         self.root.configure(bg=C["desk"])
 
         self.submissions = StringVar(value="")
-        self.output = StringVar(value=str(app_dir() / "成绩表.xlsx"))
+        self.output = StringVar(value=str(suggest_output_path(app_dir())))
         self.class_mode = StringVar(value="auto")
         self.class_custom = StringVar(value="")
         self.skip_self_check = BooleanVar(value=False)
         self.busy = False
         self.last_output: Path | None = None
+        self.last_rows: list[GradeRow] = []
+        self.last_submissions: Path | None = None
+        self.last_class_name: str | None = None
+        self._answer_text: str | None = None
+        self._review_win = None
 
         # 字体：标题用宋体（试卷抬头感），正文雅黑，日志等宽
         self.font_brand = _pick_font(["华文中宋", "STZhongsong", "SimSun", "宋体"], 22, "bold")
@@ -266,7 +280,7 @@ class GradeApp:
 
         Label(
             head,
-            text="把学生作业总文件夹选好，一键批改打字、简历表和命名，导出 Excel。",
+            text="选作业总文件夹（或 ZIP）→ 可先预检 → 一键批改 → 复核改分。成绩含预检/学情/教务简表。",
             bg=C["paper"],
             fg=C["muted"],
             font=self.font_ui,
@@ -293,8 +307,8 @@ class GradeApp:
 
         self._field_block(
             form,
-            "学生作业文件夹",
-            "选「一人一个子文件夹」的总目录",
+            "学生作业",
+            "点「浏览」可选文件夹，或 ZIP 压缩包（自动解压）",
             self.submissions,
             self._browse_submissions,
         )
@@ -374,6 +388,14 @@ class GradeApp:
         )
         self.btn_run.pack(side=LEFT)
 
+        self.btn_precheck = ttk.Button(
+            actions,
+            text="预检",
+            style="Ghost.TButton",
+            command=self._run_precheck,
+        )
+        self.btn_precheck.pack(side=LEFT, padx=(10, 0))
+
         self.btn_open = ttk.Button(
             actions,
             text="打开成绩表",
@@ -390,6 +412,14 @@ class GradeApp:
             state=DISABLED,
         )
         self.btn_folder.pack(side=LEFT, padx=(8, 0))
+        self.btn_review = ttk.Button(
+            actions,
+            text="复核改分",
+            style="Ghost.TButton",
+            command=self._open_review,
+            state=DISABLED,
+        )
+        self.btn_review.pack(side=LEFT, padx=(8, 0))
 
         self.status = Label(
             actions,
@@ -542,23 +572,252 @@ class GradeApp:
         self.root.after_idle(lambda: self.class_entry.focus_set())
 
     def _browse_submissions(self):
-        path = filedialog.askdirectory(
-            title="选择学生作业总文件夹",
-            initialdir=str(app_dir()),
+        """浏览：可选文件夹或 ZIP（ZIP 会自动解压并填入解压目录）。"""
+        choice = self._ask_folder_or_zip()
+        if choice is None:
+            return
+        initial = str(app_dir())
+        if choice == "folder":
+            path = filedialog.askdirectory(
+                title="选择学生作业总文件夹（一人一个子文件夹）",
+                initialdir=initial,
+            )
+            if not path:
+                return
+            self._apply_submissions_path(Path(path), quiet=True)
+            return
+
+        zpath = filedialog.askopenfilename(
+            title="选择学生作业 ZIP 压缩包",
+            filetypes=[("ZIP 压缩包", "*.zip"), ("所有文件", "*.*")],
+            initialdir=initial,
         )
-        if path:
-            self.submissions.set(path)
+        if not zpath:
+            return
+        self._apply_submissions_path(Path(zpath), quiet=False)
+
+    def _ask_folder_or_zip(self) -> str | None:
+        """返回 'folder' / 'zip' / None(取消)。"""
+        from tkinter import Toplevel
+
+        top = Toplevel(self.root)
+        top.title("选择作业来源")
+        top.configure(bg=C["paper"])
+        top.resizable(False, False)
+        top.transient(self.root)
+        top.grab_set()
+        result: dict[str, str | None] = {"v": None}
+
+        Label(
+            top,
+            text="学生作业是文件夹，还是 ZIP 压缩包？",
+            bg=C["paper"],
+            fg=C["ink"],
+            font=self.font_ui,
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(18, 8))
+        Label(
+            top,
+            text="选 ZIP 后会自动解压到同级「原名_解压」目录。",
+            bg=C["paper"],
+            fg=C["muted"],
+            font=self.font_small,
+            anchor="w",
+        ).pack(fill="x", padx=20, pady=(0, 12))
+
+        bar = Frame(top, bg=C["paper"])
+        bar.pack(fill="x", padx=20, pady=(0, 18))
+        for col in range(3):
+            bar.columnconfigure(col, weight=1, uniform="choice")
+
+        def pick(v: str):
+            result["v"] = v
+            top.destroy()
+
+        # 三钮等宽等高：统一 padding；主选项仅用朱红底区分
+        style = ttk.Style()
+        style.configure(
+            "Choice.TButton",
+            font=self.font_ui,
+            padding=(12, 8),
+            background=C["margin"],
+            foreground="#FFFFFF",
+            borderwidth=0,
+        )
+        style.map(
+            "Choice.TButton",
+            background=[("active", C["margin_dark"]), ("disabled", "#C9A8A4")],
+            foreground=[("disabled", "#F5EDEC")],
+        )
+        style.configure(
+            "ChoiceGhost.TButton",
+            font=self.font_ui,
+            padding=(12, 8),
+            background=C["paper"],
+            foreground=C["ink"],
+        )
+        style.map(
+            "ChoiceGhost.TButton",
+            background=[("active", C["rule"]), ("disabled", C["paper"])],
+        )
+
+        btn_w = 12
+        ttk.Button(
+            bar,
+            text="选文件夹",
+            style="Choice.TButton",
+            width=btn_w,
+            command=lambda: pick("folder"),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            bar,
+            text="选 ZIP 包",
+            style="ChoiceGhost.TButton",
+            width=btn_w,
+            command=lambda: pick("zip"),
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(
+            bar,
+            text="取消",
+            style="ChoiceGhost.TButton",
+            width=btn_w,
+            command=lambda: pick(""),
+        ).grid(row=0, column=2, sticky="ew")
+
+        top.update_idletasks()
+        # 固定弹窗宽度，三列均分后视觉更齐
+        min_w = max(top.winfo_reqwidth(), 420)
+        top.minsize(min_w, top.winfo_reqheight())
+        tw, th = min_w, top.winfo_reqheight()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        x = rx + max(0, (rw - tw) // 2)
+        y = ry + max(0, (rh - th) // 2)
+        top.geometry(f"{tw}x{th}+{x}+{y}")
+        top.wait_window()
+        v = result["v"]
+        if not v:
+            return None
+        return v
+
+    def _apply_submissions_path(self, path: Path, quiet: bool = True) -> Path | None:
+        """把路径写入作业栏；若是 ZIP 则先解压。成功返回最终目录。"""
+        path = Path(path).expanduser()
+        try:
+            path = path.resolve(strict=False)
+        except Exception:
+            pass
+        if not path.exists():
+            messagebox.showwarning("提示", f"路径不存在：\n{path}")
+            return None
+
+        dest = path
+        if path.is_file():
+            if path.suffix.lower() != ".zip":
+                messagebox.showwarning("提示", "请选择文件夹，或 .zip 压缩包。")
+                return None
+            try:
+                self._set_status("正在解压 ZIP…", "warn")
+                self.root.update_idletasks()
+                dest = unpack_submission_zip(path)
+            except Exception as e:
+                self._set_status("解压失败", "err")
+                messagebox.showerror("解压失败", str(e))
+                return None
+            self._log(f"已解压 ZIP「{path.name}」→ {dest}")
+            if not quiet:
+                messagebox.showinfo(
+                    "解压完成",
+                    f"已解压到：\n{dest}\n\n已填入作业路径，可先「预检」或直接「开始批改」。",
+                )
+            self._set_status("就绪", "muted")
+        elif not path.is_dir():
+            messagebox.showwarning("提示", "请选择文件夹或 ZIP 压缩包。")
+            return None
+
+        self.submissions.set(str(dest))
+        hint = self.class_custom.get().strip() if self.class_mode.get() == "custom" else ""
+        self.output.set(str(suggest_output_path(app_dir(), hint)))
+        return dest
+
+    def _resolve_submissions_dir(self) -> Path | None:
+        """读取界面路径；若仍是 ZIP 则解压。无效则提示并返回 None。"""
+        raw_sub = self.submissions.get().strip().strip('"')
+        if not raw_sub or raw_sub in {".", "./", ".\\"}:
+            messagebox.showwarning(
+                "提示",
+                "请先选择学生作业（点「浏览」可选文件夹或 ZIP 包）。",
+            )
+            return None
+        sub = Path(raw_sub).expanduser()
+        try:
+            sub = sub.resolve(strict=False)
+        except Exception:
+            pass
+        if not sub.exists():
+            messagebox.showwarning("提示", f"路径不存在：\n{sub}")
+            return None
+        if sub.is_file() and sub.suffix.lower() == ".zip":
+            return self._apply_submissions_path(sub, quiet=False)
+        if sub.is_dir():
+            return sub
+        messagebox.showwarning("提示", "请选择有效的作业文件夹，或 .zip 压缩包。")
+        return None
 
     def _browse_output(self):
         path = filedialog.asksaveasfilename(
             title="成绩表保存位置",
             defaultextension=".xlsx",
             filetypes=[("Excel 工作簿", "*.xlsx")],
-            initialfile="成绩表.xlsx",
+            initialfile=Path(self.output.get() or "成绩表.xlsx").name,
             initialdir=str(app_dir()),
         )
         if path:
             self.output.set(path)
+
+    def _run_precheck(self):
+        if self.busy:
+            return
+        sub = self._resolve_submissions_dir()
+        if sub is None:
+            return
+
+        self.busy = True
+        self.btn_run.configure(state=DISABLED)
+        self.btn_precheck.configure(state=DISABLED)
+        self._set_status("预检中…", "warn")
+
+        def work():
+            try:
+                _students, pre = precheck_submissions(sub)
+                ok = sum(1 for p in pre if p.status == "可批改")
+                warn = [p for p in pre if p.can_grade and p.status != "可批改"]
+                bad = [p for p in pre if not p.can_grade]
+                lines = [
+                    f"预检完成：共 {len(pre)} 人",
+                    f"可批改 {ok}　部分问题 {len(warn)}　无法批改 {len(bad)}",
+                ]
+                for p in warn + bad:
+                    lines.append(f"· {p.student_name or p.folder}：{p.status}｜{p.issues}")
+                text = "\n".join(lines)
+                self.root.after(0, lambda: self._precheck_done(text, len(bad)))
+            except Exception as e:
+                detail = traceback.format_exc()
+                self.root.after(
+                    0,
+                    lambda: self._done_err(self._friendly_error(e), detail),
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _precheck_done(self, text: str, bad_n: int):
+        self.busy = False
+        self.btn_run.configure(state=NORMAL)
+        self.btn_precheck.configure(state=NORMAL)
+        self._log("\n" + "—" * 36)
+        self._log(text)
+        self._set_status("预检完成", "warn" if bad_n else "ok")
+        messagebox.showinfo("预检结果", text if len(text) < 1200 else text[:1200] + "\n…")
 
     def _log(self, msg: str):
         self.log.configure(state=NORMAL)
@@ -573,16 +832,9 @@ class GradeApp:
     def _start(self):
         if self.busy:
             return
-        raw_sub = self.submissions.get().strip().strip('"')
-        # Path("") 在 Windows 上等于「当前目录」，会误批 release/答案
-        if not raw_sub or raw_sub in {".", "./", ".\\"}:
-            messagebox.showwarning("提示", "请先选择学生作业文件夹（浏览选「一人一个子文件夹」的总目录）。")
+        sub = self._resolve_submissions_dir()
+        if sub is None:
             return
-        sub = Path(raw_sub).expanduser()
-        try:
-            sub = sub.resolve(strict=False)
-        except Exception:
-            pass
         raw_out = self.output.get().strip().strip('"')
         if not raw_out or raw_out in {".", "./", ".\\"}:
             messagebox.showwarning(
@@ -595,17 +847,15 @@ class GradeApp:
         except Exception:
             pass
         if out.exists() and out.is_dir():
-            out = out / "成绩表.xlsx"
+            out = suggest_output_path(out)
         if out.suffix.lower() not in {".xlsx", ".xlsm"}:
             messagebox.showwarning("提示", "成绩表请保存为 .xlsx 文件。")
-            return
-        if not sub.exists() or not sub.is_dir():
-            messagebox.showwarning("提示", "请先选择有效的学生作业文件夹。")
             return
         if out.parent == out or not out.parent.exists():
             messagebox.showwarning("提示", "成绩表保存目录不存在，请重新选择保存位置。")
             return
-        # 同步回界面，避免空路径再次触发
+        # 已存在则自动换名，避免覆盖上一份
+        out = unique_output_path(out)
         self.output.set(str(out))
 
         mode = self.class_mode.get()
@@ -621,8 +871,10 @@ class GradeApp:
 
         self.busy = True
         self.btn_run.configure(state=DISABLED)
+        self.btn_precheck.configure(state=DISABLED)
         self.btn_open.configure(state=DISABLED)
         self.btn_folder.configure(state=DISABLED)
+        self.btn_review.configure(state=DISABLED)
         self._set_status("批改中…", "warn")
         self._log("\n" + "—" * 36)
         self._log(f"提交目录：{sub}")
@@ -656,21 +908,34 @@ class GradeApp:
                     )
 
                 rows = grade_all(
-                    sub, out, class_name=class_name, on_progress=on_progress
+                    sub,
+                    out,
+                    class_name=class_name,
+                    on_progress=on_progress,
+                    avoid_overwrite=True,
                 )
-                totals = [r.total for r in rows]
+                real_out = getattr(grade_all, "last_output", out)
+                totals = [r.effective_total() for r in rows]
                 used = rows[0].class_name if rows else ""
                 summary = (
                     f"完成：共 {len(rows)} 人。\n"
                     f"班级栏：{used if used else '（空）'}\n"
-                    f"输出：{out}"
+                    f"输出：{real_out}"
                 )
                 if totals:
                     summary += (
                         f"\n总分 平均 {sum(totals)/len(totals):.1f}，"
                         f"最高 {max(totals)}，最低 {min(totals)}"
                     )
-                self.root.after(0, lambda: self._done_ok(out, summary))
+                top = deduction_stats(rows)[:3]
+                if top:
+                    summary += "\n高频未满分：" + "；".join(
+                        f"{a}({b}人)" for a, b, _ in top
+                    )
+                self.root.after(
+                    0,
+                    lambda: self._done_ok(real_out, summary, rows, sub, class_name),
+                )
             except Exception as e:
                 detail = traceback.format_exc()
                 user_msg = self._friendly_error(e)
@@ -696,19 +961,39 @@ class GradeApp:
             return f"批改未能完成：{msg}"
         return "批改未能完成，请查看下方「批改记录」。"
 
-    def _done_ok(self, out: Path, summary: str):
+    def _done_ok(
+        self,
+        out: Path,
+        summary: str,
+        rows: list[GradeRow] | None = None,
+        submissions: Path | None = None,
+        class_name: str | None = None,
+    ):
         self.busy = False
         self.btn_run.configure(state=NORMAL)
+        self.btn_precheck.configure(state=NORMAL)
         self.btn_open.configure(state=NORMAL)
         self.btn_folder.configure(state=NORMAL)
+        self.btn_review.configure(state=NORMAL)
         self.last_output = out
+        self.output.set(str(out))
+        if rows is not None:
+            self.last_rows = rows
+        if submissions is not None:
+            self.last_submissions = submissions
+        self.last_class_name = class_name
         self._log(summary)
         self._set_status("完成", "ok")
-        messagebox.showinfo("批改完成", summary)
+        if messagebox.askyesno(
+            "批改完成",
+            summary + "\n\n是否打开「复核改分」窗口？（可打开学生文件、改分、单人重批）",
+        ):
+            self._open_review()
 
     def _done_err(self, user_msg: str, detail: str = ""):
         self.busy = False
         self.btn_run.configure(state=NORMAL)
+        self.btn_precheck.configure(state=NORMAL)
         if detail:
             self._log("出错了：\n" + detail)
         else:
@@ -728,6 +1013,230 @@ class GradeApp:
         folder = path.parent if path.suffix else path
         if folder.exists():
             os.startfile(str(folder))  # noqa: S606
+
+    def _selected_row(self, tree) -> GradeRow | None:
+        sel = tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先在列表里点选一名学生。")
+            return None
+        idx = int(sel[0])
+        if idx < 0 or idx >= len(self.last_rows):
+            return None
+        return self.last_rows[idx]
+
+    def _open_path(self, path_str: str, missing_msg: str):
+        if not path_str:
+            messagebox.showwarning("提示", missing_msg)
+            return
+        p = Path(path_str)
+        if not p.exists():
+            messagebox.showwarning("提示", f"文件不存在：\n{p}")
+            return
+        os.startfile(str(p))  # noqa: S606
+
+    def _persist_rows(self, note: str = ""):
+        if not self.last_output:
+            messagebox.showwarning("提示", "还没有成绩表路径。")
+            return
+        try:
+            out = save_rows(
+                self.last_rows,
+                self.last_output,
+                submissions=self.last_submissions,
+                avoid_overwrite=False,
+            )
+            self.last_output = out
+            self.output.set(str(out))
+            if note:
+                self._log(note)
+            self._log(f"已写回：{out}")
+        except Exception as e:
+            messagebox.showerror("保存失败", self._friendly_error(e))
+            self._log(traceback.format_exc())
+
+    def _open_review(self):
+        if not self.last_rows:
+            messagebox.showwarning("提示", "请先完成一次批改，再打开复核。")
+            return
+
+        if self._review_win is not None:
+            try:
+                if self._review_win.winfo_exists():
+                    self._review_win.lift()
+                    self._review_win.focus_force()
+                    return
+            except Exception:
+                pass
+
+        from tkinter import Toplevel, simpledialog
+
+        top = Toplevel(self.root)
+        top.title("复核改分 · OfficeGrade")
+        top.configure(bg=C["paper"])
+        self._review_win = top
+        top.protocol("WM_DELETE_WINDOW", lambda: self._close_review(top))
+        # 相对主窗口居中
+        win_w, win_h = 920, 560
+        self.root.update_idletasks()
+        rw = max(self.root.winfo_width(), 1)
+        rh = max(self.root.winfo_height(), 1)
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        x = rx + max(0, (rw - win_w) // 2)
+        y = ry + max(0, (rh - win_h) // 2)
+        top.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        top.transient(self.root)
+        top.lift()
+        top.focus_force()
+
+        Label(
+            top,
+            text="点选学生 → 打开打字/简历核对 → 必要时改最终分或单人重批。改完会写回当前成绩表。",
+            bg=C["paper"],
+            fg=C["muted"],
+            font=self.font_small,
+            anchor="w",
+            justify=LEFT,
+            wraplength=880,
+        ).pack(fill="x", padx=12, pady=(10, 4))
+
+        cols = ("姓名", "自动分", "最终分", "打字", "简历", "文件夹")
+        tree = ttk.Treeview(top, columns=cols, show="headings", height=18)
+        for c, w in zip(cols, (90, 80, 80, 60, 60, 420)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="center" if c != "文件夹" else "w")
+        tree.pack(fill=BOTH, expand=True, padx=12, pady=6)
+
+        def refill():
+            tree.delete(*tree.get_children())
+            for i, r in enumerate(self.last_rows):
+                tree.insert(
+                    "",
+                    END,
+                    iid=str(i),
+                    values=(
+                        r.student_name,
+                        r.total,
+                        r.effective_total(),
+                        "有" if r.typing_file else "缺",
+                        "有" if r.resume_file else "缺",
+                        r.folder,
+                    ),
+                )
+
+        refill()
+        self._review_tree = tree
+        self._review_refill = refill
+
+        bar = Frame(top, bg=C["paper"])
+        bar.pack(fill="x", padx=12, pady=(0, 12))
+
+        def open_typing():
+            r = self._selected_row(tree)
+            if r:
+                self._open_path(r.typing_fullpath, "该生没有打字文件路径。")
+
+        def open_resume():
+            r = self._selected_row(tree)
+            if r:
+                self._open_path(r.resume_fullpath, "该生没有简历文件路径。")
+
+        def open_folder():
+            r = self._selected_row(tree)
+            if r:
+                self._open_path(r.folder_path, "找不到该生文件夹。")
+
+        def adjust_score():
+            r = self._selected_row(tree)
+            if not r:
+                return
+            cur = r.effective_total()
+            raw = simpledialog.askstring(
+                "改最终总分",
+                f"{r.student_name or r.folder}\n自动分 {r.total}，当前最终分 {cur}\n请输入新的最终总分（0–100）：",
+                parent=top,
+                initialvalue=str(cur),
+            )
+            if raw is None:
+                return
+            try:
+                val = float(raw.strip())
+            except ValueError:
+                messagebox.showwarning("提示", "请输入数字。", parent=top)
+                return
+            if val < 0 or val > 100:
+                messagebox.showwarning("提示", "分数需在 0–100。", parent=top)
+                return
+            reason = simpledialog.askstring(
+                "改分说明",
+                "请写一句改分原因（会写入成绩表「改分说明」列）：",
+                parent=top,
+                initialvalue=r.adjust_note or "人工复核调整",
+            )
+            if reason is None:
+                return
+            r.final_total = round(val, 1)
+            r.adjust_note = (reason or "").strip()
+            refill()
+            self._persist_rows(
+                f"已改分：{r.student_name or r.folder} → 最终 {r.final_total}（{r.adjust_note}）"
+            )
+            messagebox.showinfo("已保存", "最终总分已写回成绩表。", parent=top)
+
+        def regrade_one():
+            r = self._selected_row(tree)
+            if not r:
+                return
+            if not self.last_submissions:
+                messagebox.showwarning("提示", "缺少提交目录，无法重批。", parent=top)
+                return
+            if not messagebox.askyesno(
+                "单人重批",
+                f"确认重新批改「{r.student_name or r.folder}」？\n会按当前文件夹里的文件重算自动分。",
+                parent=top,
+            ):
+                return
+            try:
+                if self._answer_text is None:
+                    self._answer_text = load_typing_answer_text()
+                self.last_rows = regrade_one_in_rows(
+                    self.last_rows,
+                    r.folder,
+                    self.last_submissions,
+                    answer_text=self._answer_text,
+                    class_name=r.class_name,
+                )
+                refill()
+                self._persist_rows(f"已重批：{r.student_name or r.folder}")
+                messagebox.showinfo("已重批", "该生已重批并写回成绩表。", parent=top)
+            except Exception as e:
+                messagebox.showerror("重批失败", self._friendly_error(e), parent=top)
+                self._log(traceback.format_exc())
+
+        ttk.Button(bar, text="打开打字", style="Ghost.TButton", command=open_typing).pack(
+            side=LEFT
+        )
+        ttk.Button(bar, text="打开简历", style="Ghost.TButton", command=open_resume).pack(
+            side=LEFT, padx=(8, 0)
+        )
+        ttk.Button(bar, text="打开文件夹", style="Ghost.TButton", command=open_folder).pack(
+            side=LEFT, padx=(8, 0)
+        )
+        ttk.Button(bar, text="改最终分", style="Ghost.TButton", command=adjust_score).pack(
+            side=LEFT, padx=(16, 0)
+        )
+        ttk.Button(bar, text="单人重批", style="Ghost.TButton", command=regrade_one).pack(
+            side=LEFT, padx=(8, 0)
+        )
+        ttk.Button(
+            bar, text="打开成绩表", style="Ghost.TButton", command=self._open_excel
+        ).pack(side=RIGHT)
+
+    def _close_review(self, top):
+        try:
+            top.destroy()
+        except Exception:
+            pass
+        self._review_win = None
 
 
 def run_gui():

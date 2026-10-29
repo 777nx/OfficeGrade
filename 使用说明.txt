@@ -30,16 +30,23 @@ Word 操作题自动批改 —— 使用说明
      某班作业\
        张三\打字测试.docx / 简历表.docx
        李四\...
+   若只有 ZIP：点作业栏「浏览」→「选 ZIP 包」，会解到「原名_解压」并自动填入路径。
 
 2. 双击 OfficeGrade.exe，打开图形界面
 
 3. 在界面里：
-   - 点「浏览」选择学生作业总目录
+   - 点「浏览」：可选「文件夹」或「ZIP 包」
+   - 建议先点「预检」：看谁缺打字/简历、谁交了快捷方式或试卷原件
    - 班级可选：自动 / 留空 / 指定
    - 点「开始批改」
-   - 完成后可「打开成绩表」
+   - 完成后可「打开成绩表」，或进入「复核改分」：打开学生文件、改最终分、单人重批
 
-4. 成绩表默认保存在 exe 同目录的「成绩表.xlsx」
+4. 成绩表默认带时间戳文件名（如 成绩表_20261029_1430.xlsx），避免覆盖上一份。
+   工作簿里有多张表：
+     - 成绩表：分项分 + 自动总分 + 最终总分 + 改分说明 + 白话备注
+     - 预检报告：缺题/无效文件等问题名单（橙/红底）
+     - 学情统计：平均分、分数段、高频未满分项（讲评用）
+     - 教务简表：班级/姓名/总分等稳定列（暂无固定模板，有教务表头后再映射）
    「备注」列用白话写了扣分原因和差哪些字。
 
 
@@ -48,6 +55,8 @@ Word 操作题自动批改 —— 使用说明
 OfficeGrade.exe --cli --submissions "D:\某班作业" --output "D:\成绩.xlsx"
 OfficeGrade.exe --cli --submissions "D:\某班作业" --class-name "26电子商务1班"
 OfficeGrade.exe --cli --submissions "D:\某班作业" --no-class
+OfficeGrade.exe --cli --submissions "D:\某班作业" --precheck
+OfficeGrade.exe --cli --allow-overwrite --submissions "D:\某班作业" --output "D:\成绩.xlsx"
 OfficeGrade.exe --cli --self-check
 OfficeGrade.exe --gui
 

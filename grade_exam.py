@@ -9,14 +9,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from collections import Counter
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -1407,7 +1410,7 @@ def score_resume(path: Optional[Path]) -> ResumeScores:
 
 
 # ---------------------------------------------------------------------------
-# excel
+# excel / precheck / output helpers
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -1430,9 +1433,248 @@ class GradeRow:
     naming: float
     total: float
     remarks: str
+    # 复核 / 教务对接扩展（默认不影响旧逻辑）
+    student_id: str = ""
+    folder_path: str = ""
+    typing_fullpath: str = ""
+    resume_fullpath: str = ""
+    final_total: Optional[float] = None
+    adjust_note: str = ""
+
+    def effective_total(self) -> float:
+        if self.final_total is None:
+            return self.total
+        return self.final_total
 
 
-def write_excel(rows: list[GradeRow], out: Path):
+@dataclass
+class PrecheckRow:
+    folder: str
+    student_name: str
+    class_name: str
+    status: str
+    issues: str
+    typing_file: str
+    resume_file: str
+    can_grade: bool
+
+
+# 自动生成的防覆盖后缀：_20261029_150737 或叠加重试 _20261029_150737_1
+_AUTO_TS_SUFFIX = re.compile(r"(?:_\d{8}_\d{6})+(?:_\d+)?$")
+
+
+def strip_auto_timestamp_stem(stem: str) -> str:
+    """去掉文件名末尾自动加的时间戳，避免二次批改叠成 成绩表_时间_时间.xlsx。"""
+    cleaned = _AUTO_TS_SUFFIX.sub("", stem or "").rstrip("_")
+    return cleaned or "成绩表"
+
+
+def unique_output_path(path: Path) -> Path:
+    """
+    生成不覆盖旧表的输出路径。
+    - 若路径已带本程序自动时间戳（上次批改写入栏里的那种），先剥掉再换新时间戳
+    - 若裸文件名且尚不存在，保持原名
+    - 若裸文件名已存在，则改为 原名_年月日_时分秒.xlsx
+    """
+    path = Path(path)
+    suffix = path.suffix if path.suffix else ".xlsx"
+    raw_stem = path.stem
+    clean_stem = strip_auto_timestamp_stem(raw_stem)
+    had_auto_ts = clean_stem != raw_stem
+
+    if not path.exists() and not had_auto_ts:
+        return path if path.suffix else path.with_suffix(suffix)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = path.with_name(f"{clean_stem}_{stamp}{suffix}")
+    n = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{clean_stem}_{stamp}_{n}{suffix}")
+        n += 1
+    return candidate
+
+
+def suggest_output_path(directory: Optional[Path] = None, class_hint: str = "") -> Path:
+    """默认输出名：成绩表_班级_时间戳.xlsx（班级可空）。"""
+    base = Path(directory) if directory else app_dir()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    hint = re.sub(r'[\\/:*?"<>|]+', "", (class_hint or "").strip())
+    stem = f"成绩表_{hint}" if hint else "成绩表"
+    # 直接拼时间戳；若同秒冲突由 unique 处理（会先剥旧戳再换新戳）
+    return unique_output_path(base / f"{stem}_{stamp}.xlsx")
+
+
+def extract_seat_or_id(folder_name: str) -> str:
+    """从文件夹名尽量抠座位号/学号样片段，供教务简表预留；抠不到则空。"""
+    raw = folder_name or ""
+    if raw.startswith("(根目录)"):
+        raw = raw[len("(根目录)") :]
+    m = re.match(r"^([A-Za-z]\d{1,3})_", raw)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"(?:学号|编号)[:：\s]*([A-Za-z0-9]{4,20})", raw)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def unpack_submission_zip(zip_path: Path, dest_dir: Optional[Path] = None) -> Path:
+    """
+    把作业 ZIP 解到同级「原名_解压」目录（已存在则加时间戳）。
+    仅支持 .zip；解压后返回学生作业总目录。
+    """
+    zip_path = Path(zip_path)
+    if not zip_path.is_file() or zip_path.suffix.lower() != ".zip":
+        raise ValueError("请选择 .zip 压缩包。")
+    if dest_dir is None:
+        dest_dir = zip_path.parent / f"{zip_path.stem}_解压"
+        if dest_dir.exists():
+            dest_dir = zip_path.parent / (
+                f"{zip_path.stem}_解压_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        # 尽量正确处理中文文件名（部分 Windows 打的包是 GBK）
+        for info in zf.infolist():
+            name = info.filename
+            try:
+                name_bytes = name.encode("cp437")
+                try:
+                    name = name_bytes.decode("gbk")
+                except UnicodeDecodeError:
+                    name = name_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            target = dest_dir / name
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+    return dest_dir
+
+
+def sort_by_name_pinyin(rows: list, name_attr: str = "student_name", folder_attr: str = "folder"):
+    """按姓名拼音升序；同音再比姓名、文件夹。兼容 GradeRow / PrecheckRow。"""
+
+    def key(row):
+        name = getattr(row, name_attr, "") or ""
+        folder = getattr(row, folder_attr, "") or ""
+        py = "".join(lazy_pinyin(name)).lower()
+        return (py, name, folder)
+
+    return sorted(rows, key=key)
+
+
+def build_precheck(students: list[StudentWork]) -> list[PrecheckRow]:
+    rows: list[PrecheckRow] = []
+    for sw in students:
+        issues: list[str] = []
+        has_t = sw.typing_path is not None
+        has_r = sw.resume_path is not None
+        if not has_t:
+            issues.append("缺打字测试")
+        if not has_r:
+            issues.append("缺简历表")
+        for note in sw.notes:
+            if "快捷方式" in note:
+                issues.append("含无效快捷方式(.lnk)")
+            if "试卷原件" in note or "是试卷" in note:
+                issues.append("交了试卷原件")
+            if "转换失败" in note:
+                issues.append(".doc转换失败")
+            if "多份" in note:
+                issues.append("同题多文件")
+        # 去重并保持顺序
+        seen = set()
+        uniq = []
+        for x in issues:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        if has_t and has_r and not uniq:
+            status = "可批改"
+        elif has_t or has_r:
+            status = "部分可批（缺题）"
+        else:
+            status = "无法批改（两题皆缺）"
+        can_grade = has_t or has_r
+        rows.append(
+            PrecheckRow(
+                folder=sw.folder_name,
+                student_name=sw.student_name or "",
+                class_name=sw.class_name or "",
+                status=status,
+                issues="；".join(uniq) if uniq else "无",
+                typing_file=sw.typing_path.name if sw.typing_path else "",
+                resume_file=sw.resume_path.name if sw.resume_path else "",
+                can_grade=can_grade,
+            )
+        )
+    return sort_by_name_pinyin(rows, folder_attr="folder")
+
+
+def precheck_submissions(submissions: Path) -> tuple[list[StudentWork], list[PrecheckRow]]:
+    students = discover_students(Path(submissions))
+    return students, build_precheck(students)
+
+
+def deduction_stats(rows: list[GradeRow]) -> list[tuple[str, int, float]]:
+    """返回 [(扣分点名称, 未满分人数, 占比%), ...] 按人数降序。"""
+    if not rows:
+        return []
+    n = len(rows)
+    keys = [
+        ("打字完整度未满分", lambda r: r.typing_complete < SCORE_TYPING_COMPLETE - 0.05),
+        ("打字准确率未满分", lambda r: r.typing_accuracy < SCORE_TYPING_ACCURACY - 0.05),
+        ("简历完整度未满分", lambda r: r.resume_complete < 9.95),
+        ("标题样式未满分", lambda r: r.resume_title < 4.95),
+        ("字体/加粗未满分", lambda r: r.resume_font < 4.95),
+        ("照片纵向/居中未满分", lambda r: r.resume_photo < 9.95),
+        ("双线边框未满分", lambda r: r.resume_double < 9.95),
+        ("灰色底纹未满分", lambda r: r.resume_gray < 9.95),
+        ("文件命名未满分", lambda r: r.naming < 9.95),
+        ("缺打字文件", lambda r: not r.typing_file),
+        ("缺简历文件", lambda r: not r.resume_file),
+    ]
+    out: list[tuple[str, int, float]] = []
+    for label, pred in keys:
+        c = sum(1 for r in rows if pred(r))
+        if c:
+            out.append((label, c, round(100.0 * c / n, 1)))
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out
+
+
+def _style_header_row(ws, headers: list[str], fill_color: str = "D9E2F3"):
+    from openpyxl.utils import get_column_letter
+
+    header_font = Font(bold=True)
+    thin = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+    fill = PatternFill("solid", fgColor=fill_color)
+    for col, _ in enumerate(headers, 1):
+        cell = ws.cell(1, col)
+        cell.font = header_font
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        cell.border = thin
+    return thin
+
+
+def write_excel(
+    rows: list[GradeRow],
+    out: Path,
+    precheck: Optional[list[PrecheckRow]] = None,
+):
+    from openpyxl.utils import get_column_letter
+
     wb = Workbook()
     ws = wb.active
     ws.title = "成绩表"
@@ -1453,26 +1695,16 @@ def write_excel(rows: list[GradeRow], out: Path):
         "灰色底纹/10",
         "简历小计/50",
         "命名/10",
-        "总分/100",
+        "自动总分/100",
+        "最终总分/100",
+        "改分说明",
         "备注",
     ]
     ws.append(headers)
-    header_font = Font(bold=True)
-    thin = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin"),
-    )
-    fill = PatternFill("solid", fgColor="D9E2F3")
-    for col, _ in enumerate(headers, 1):
-        cell = ws.cell(1, col)
-        cell.font = header_font
-        cell.fill = fill
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-        cell.border = thin
+    thin = _style_header_row(ws, headers)
 
     for r in rows:
+        final = r.effective_total()
         ws.append(
             [
                 r.class_name,
@@ -1492,6 +1724,8 @@ def write_excel(rows: list[GradeRow], out: Path):
                 r.resume_total,
                 r.naming,
                 r.total,
+                final,
+                r.adjust_note,
                 r.remarks,
             ]
         )
@@ -1501,21 +1735,189 @@ def write_excel(rows: list[GradeRow], out: Path):
             cell.border = thin
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-    from openpyxl.utils import get_column_letter
-
-    widths = [16, 10, 28, 22, 22, 12, 12, 12, 12, 10, 10, 10, 10, 10, 12, 10, 10, 80]
+    widths = [
+        16, 10, 28, 22, 22,
+        12, 12, 12, 12, 10, 10, 10, 10, 10, 12, 10,
+        12, 12, 18, 80,
+    ]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
-
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes = "C2"
 
-    # 汇总页
+    # —— 预检 / 问题名单 ——
+    ws_pre = wb.create_sheet("预检报告")
+    pre_headers = [
+        "文件夹",
+        "姓名",
+        "班级",
+        "状态",
+        "问题",
+        "打字文件",
+        "简历文件",
+        "可否批改",
+    ]
+    ws_pre.append(pre_headers)
+    thin_pre = _style_header_row(ws_pre, pre_headers, "FCE4D6")
+    pre_rows = precheck
+    if pre_rows is None:
+        # 从成绩行反推简版预检（成绩表已按拼音排，这里再统一排一次更稳）
+        pre_rows = []
+        for r in rows:
+            issues = []
+            if not r.typing_file:
+                issues.append("缺打字测试")
+            if not r.resume_file:
+                issues.append("缺简历表")
+            status = (
+                "可批改"
+                if r.typing_file and r.resume_file
+                else ("部分可批（缺题）" if (r.typing_file or r.resume_file) else "无法批改（两题皆缺）")
+            )
+            pre_rows.append(
+                PrecheckRow(
+                    folder=r.folder,
+                    student_name=r.student_name,
+                    class_name=r.class_name,
+                    status=status,
+                    issues="；".join(issues) if issues else "无",
+                    typing_file=r.typing_file,
+                    resume_file=r.resume_file,
+                    can_grade=bool(r.typing_file or r.resume_file),
+                )
+            )
+    pre_rows = sort_by_name_pinyin(list(pre_rows), folder_attr="folder")
+    warn_fill = PatternFill("solid", fgColor="F8CBAD")
+    bad_fill = PatternFill("solid", fgColor="FF6B6B")
+    for p in pre_rows:
+        ws_pre.append(
+            [
+                p.folder,
+                p.student_name,
+                p.class_name,
+                p.status,
+                p.issues,
+                p.typing_file,
+                p.resume_file,
+                "是" if p.can_grade else "否",
+            ]
+        )
+        row_idx = ws_pre.max_row
+        fill = None
+        if not p.can_grade:
+            fill = bad_fill
+        elif p.status != "可批改":
+            fill = warn_fill
+        if fill:
+            for col in range(1, len(pre_headers) + 1):
+                ws_pre.cell(row_idx, col).fill = fill
+    for row in ws_pre.iter_rows(min_row=2, max_row=ws_pre.max_row, max_col=len(pre_headers)):
+        for cell in row:
+            cell.border = thin_pre
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+    for i, w in enumerate([28, 10, 16, 18, 36, 22, 22, 10], 1):
+        ws_pre.column_dimensions[get_column_letter(i)].width = w
+    ws_pre.auto_filter.ref = ws_pre.dimensions
+    ws_pre.freeze_panes = "A2"
+
+    # —— 学情统计 ——
+    ws_stat = wb.create_sheet("学情统计")
+    totals = [r.effective_total() for r in rows]
+    auto_totals = [r.total for r in rows]
+    ws_stat["A1"] = "学情概览"
+    ws_stat["A1"].font = Font(bold=True, size=14)
+    ws_stat["A2"] = "人数"
+    ws_stat["B2"] = len(rows)
+    if totals:
+        ws_stat["A3"] = "最终总分·平均"
+        ws_stat["B3"] = round(sum(totals) / len(totals), 1)
+        ws_stat["A4"] = "最终总分·最高"
+        ws_stat["B4"] = max(totals)
+        ws_stat["A5"] = "最终总分·最低"
+        ws_stat["B5"] = min(totals)
+        ws_stat["A6"] = "自动总分·平均"
+        ws_stat["B6"] = round(sum(auto_totals) / len(auto_totals), 1)
+        full = sum(1 for t in totals if t >= 99.5)
+        pass_n = sum(1 for t in totals if t >= 60)
+        fail_n = sum(1 for t in totals if t < 60)
+        ws_stat["A7"] = "满分(≥99.5)"
+        ws_stat["B7"] = full
+        ws_stat["A8"] = "及格(≥60)"
+        ws_stat["B8"] = pass_n
+        ws_stat["A9"] = "不及格(<60)"
+        ws_stat["B9"] = fail_n
+
+    ws_stat["A11"] = "分数段分布（最终总分）"
+    ws_stat["A11"].font = Font(bold=True)
+    ws_stat["A12"] = "分数段"
+    ws_stat["B12"] = "人数"
+    ws_stat["C12"] = "占比%"
+    bands = [
+        ("90–100", 90, 100.01),
+        ("80–89.9", 80, 90),
+        ("70–79.9", 70, 80),
+        ("60–69.9", 60, 70),
+        ("0–59.9", 0, 60),
+    ]
+    for i, (label, lo, hi) in enumerate(bands):
+        c = sum(1 for t in totals if lo <= t < hi)
+        ws_stat.cell(13 + i, 1, label)
+        ws_stat.cell(13 + i, 2, c)
+        ws_stat.cell(13 + i, 3, round(100.0 * c / len(totals), 1) if totals else 0)
+
+    ws_stat["A19"] = "高频未满分项（讲评用）"
+    ws_stat["A19"].font = Font(bold=True)
+    ws_stat["A20"] = "项目"
+    ws_stat["B20"] = "未满分人数"
+    ws_stat["C20"] = "占比%"
+    for i, (label, c, pct) in enumerate(deduction_stats(rows)):
+        ws_stat.cell(21 + i, 1, label)
+        ws_stat.cell(21 + i, 2, c)
+        ws_stat.cell(21 + i, 3, pct)
+    ws_stat.column_dimensions["A"].width = 28
+    ws_stat.column_dimensions["B"].width = 14
+    ws_stat.column_dimensions["C"].width = 10
+
+    # —— 教务简表（暂无固定模板：稳定列名，日后可映射）——
+    ws_edu = wb.create_sheet("教务简表")
+    edu_headers = ["班级", "姓名", "自动总分", "最终总分", "改分说明", "备注摘要"]
+    ws_edu.append(edu_headers)
+    thin_edu = _style_header_row(ws_edu, edu_headers, "E2EFDA")
+    for r in rows:
+        brief = (r.remarks or "").replace("\n", " / ")
+        if len(brief) > 80:
+            brief = brief[:77] + "…"
+        ws_edu.append(
+            [
+                r.class_name,
+                r.student_name,
+                r.total,
+                r.effective_total(),
+                r.adjust_note,
+                brief,
+            ]
+        )
+    for row in ws_edu.iter_rows(min_row=2, max_row=ws_edu.max_row, max_col=len(edu_headers)):
+        for cell in row:
+            cell.border = thin_edu
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+    for i, w in enumerate([18, 10, 10, 10, 18, 60], 1):
+        ws_edu.column_dimensions[get_column_letter(i)].width = w
+    ws_edu.auto_filter.ref = ws_edu.dimensions
+    ws_edu.freeze_panes = "A2"
+
+    # —— 说明 ——
     ws2 = wb.create_sheet("说明")
     ws2["A1"] = "评分依据见 评分标准.md；本表由自动批改程序生成，异常项请人工抽查备注列。"
-    ws2["A2"] = f"标准答案：打字测试.docx / 简历表.docx"
+    ws2["A2"] = "标准答案：打字测试.docx / 简历表.docx"
     ws2["A3"] = f"作者：{AUTHOR}"
+    ws2["A4"] = "「最终总分」默认同「自动总分」；教师复核改分后只改最终总分，并填写改分说明。"
+    ws2["A5"] = "「教务简表」列名固定，便于以后对接教务模板（有固定表头后再映射）。"
+    ws2["A6"] = "「预检报告」红色=两题皆缺无法批；橙色=缺题或部分问题，仍可能批出内容分。"
+    ws2.column_dimensions["A"].width = 100
 
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out)
 
 
@@ -1531,11 +1933,71 @@ def most_common_class(students: list[StudentWork]) -> str:
     return Counter(names).most_common(1)[0][0]
 
 
+def grade_student(
+    sw: StudentWork,
+    answer_text: str,
+    class_name: str,
+) -> GradeRow:
+    """批改单个学生，返回一行成绩（含路径，便于复核打开文件）。"""
+    naming, naming_notes = score_naming(sw)
+    tc, ta, tnotes = score_typing(sw.typing_path, answer_text)
+    rs = score_resume(sw.resume_path)
+    typing_total = round_half(tc + ta)
+    total = round_half(typing_total + rs.total + naming)
+    if naming >= 9.5 and not naming_notes:
+        naming_notes = [
+            "【文件命名】文件夹与文件名符合要求，本大题满分10分。"
+        ]
+    remark_parts = [x for x in (sw.notes + tnotes + rs.notes + naming_notes) if x]
+    if not remark_parts:
+        remark_parts = ["打字、简历、命名各项检查均达标，总分满分。"]
+    elif total >= 99.5:
+        remark_parts.append("【总评】三项合计满分100分。")
+    remarks = "\n\n".join(remark_parts)
+    return GradeRow(
+        class_name=class_name,
+        student_name=sw.student_name or "",
+        folder=sw.folder_name,
+        typing_file=sw.typing_path.name if sw.typing_path else "",
+        resume_file=sw.resume_path.name if sw.resume_path else "",
+        typing_complete=tc,
+        typing_accuracy=ta,
+        typing_total=typing_total,
+        resume_complete=rs.completeness,
+        resume_title=rs.title,
+        resume_font=rs.font_bold,
+        resume_photo=rs.photo,
+        resume_double=rs.double_border,
+        resume_gray=rs.gray,
+        resume_total=rs.total,
+        naming=naming,
+        total=total,
+        remarks=remarks,
+        student_id=extract_seat_or_id(sw.folder_name),
+        folder_path=str(sw.folder_path),
+        typing_fullpath=str(sw.typing_path) if sw.typing_path else "",
+        resume_fullpath=str(sw.resume_path) if sw.resume_path else "",
+        final_total=total,
+        adjust_note="",
+    )
+
+
+def load_typing_answer_text() -> str:
+    typing_ans = resolve_answer("打字测试.docx")
+    resume_ans = resolve_answer("简历表.docx")
+    if not typing_ans.exists() or not resume_ans.exists():
+        raise FileNotFoundError(
+            f"缺少答案文件。请确认存在：\n  {typing_ans}\n  {resume_ans}"
+        )
+    return para_full_text(Document(str(typing_ans)))
+
+
 def grade_all(
     submissions: Path,
     output: Path,
     class_name: Optional[str] = None,
-    on_progress=None,
+    on_progress: Optional[Callable] = None,
+    avoid_overwrite: bool = True,
 ) -> list[GradeRow]:
     """
     class_name:
@@ -1543,16 +2005,9 @@ def grade_all(
       - ""    → 强制留空
       - 其它  → 整表统一用该名称
     on_progress: 可选回调 (index_1based, total, display_name)
+    avoid_overwrite: 若输出路径已存在，自动换带时间戳的新文件名
     """
-    typing_ans = resolve_answer("打字测试.docx")
-    resume_ans = resolve_answer("简历表.docx")
-    if not typing_ans.exists() or not resume_ans.exists():
-        raise FileNotFoundError(
-            f"缺少答案文件。请确认存在：\n  {typing_ans}\n  {resume_ans}"
-        )
-
-    answer_doc = Document(str(typing_ans))
-    answer_text = para_full_text(answer_doc)
+    answer_text = load_typing_answer_text()
 
     students = discover_students(submissions)
     if not students:
@@ -1560,6 +2015,7 @@ def grade_all(
             f"在「{submissions}」下没有找到可批改的学生文件夹。\n"
             "请选择「一人一个子文件夹」的作业总目录（不要选程序自带的答案目录）。"
         )
+    precheck = build_precheck(students)
     if class_name is None:
         class_name = most_common_class(students)
     rows: list[GradeRow] = []
@@ -1571,55 +2027,73 @@ def grade_all(
                 on_progress(idx, total_n, sw.student_name or sw.folder_name)
             except Exception:
                 pass
-        naming, naming_notes = score_naming(sw)
-        tc, ta, tnotes = score_typing(sw.typing_path, answer_text)
-        rs = score_resume(sw.resume_path)
-        typing_total = round_half(tc + ta)
-        total = round_half(typing_total + rs.total + naming)
-        # 命名满分也写一句，方便和打字/简历备注对齐
-        if naming >= 9.5 and not naming_notes:
-            naming_notes = [
-                "【文件命名】文件夹与文件名符合要求，本大题满分10分。"
-            ]
-        remark_parts = [x for x in (sw.notes + tnotes + rs.notes + naming_notes) if x]
-        if not remark_parts:
-            remark_parts = ["打字、简历、命名各项检查均达标，总分满分。"]
-        elif total >= 99.5:
-            # 总分满分时再给一句总评（分项说明仍保留在上面）
-            remark_parts.append("【总评】三项合计满分100分。")
-        remarks = "\n\n".join(remark_parts)
-        rows.append(
-            GradeRow(
-                class_name=class_name,
-                student_name=sw.student_name or "",
-                folder=sw.folder_name,
-                typing_file=sw.typing_path.name if sw.typing_path else "",
-                resume_file=sw.resume_path.name if sw.resume_path else "",
-                typing_complete=tc,
-                typing_accuracy=ta,
-                typing_total=typing_total,
-                resume_complete=rs.completeness,
-                resume_title=rs.title,
-                resume_font=rs.font_bold,
-                resume_photo=rs.photo,
-                resume_double=rs.double_border,
-                resume_gray=rs.gray,
-                resume_total=rs.total,
-                naming=naming,
-                total=total,
-                remarks=remarks,
-            )
-        )
+        rows.append(grade_student(sw, answer_text, class_name or ""))
 
-    # 按姓名拼音排序（同音再比原名、文件夹）
-    def sort_key(r: GradeRow):
-        name = r.student_name or ""
-        py = "".join(lazy_pinyin(name)).lower()
-        return (py, name, r.folder)
-
-    rows.sort(key=sort_key)
-    write_excel(rows, output)
+    rows = sort_by_name_pinyin(rows, folder_attr="folder")
+    out = Path(output)
+    if avoid_overwrite:
+        out = unique_output_path(out)
+    write_excel(rows, out, precheck=precheck)
+    # 把实际路径写回，便于 GUI 打开
+    grade_all.last_output = out  # type: ignore[attr-defined]
     return rows
+
+
+def regrade_one_in_rows(
+    rows: list[GradeRow],
+    folder: str,
+    submissions: Path,
+    answer_text: Optional[str] = None,
+    class_name: Optional[str] = None,
+) -> list[GradeRow]:
+    """按文件夹名重批一人，保留其他人的最终分/改分说明。"""
+    if answer_text is None:
+        answer_text = load_typing_answer_text()
+    students = {sw.folder_name: sw for sw in discover_students(submissions)}
+    sw = students.get(folder)
+    if sw is None:
+        raise FileNotFoundError(f"找不到学生文件夹：{folder}")
+    # 班级：优先沿用原表该行；否则用传入/自动
+    old = next((r for r in rows if r.folder == folder), None)
+    cls = class_name
+    if cls is None:
+        cls = old.class_name if old else most_common_class(list(students.values()))
+    new_row = grade_student(sw, answer_text, cls or "")
+    if old and old.adjust_note:
+        # 重批后默认恢复自动分，但保留历史改分说明作参考
+        new_row.adjust_note = f"（已重批，原改分说明：{old.adjust_note}）"
+    out_rows = []
+    replaced = False
+    for r in rows:
+        if r.folder == folder:
+            out_rows.append(new_row)
+            replaced = True
+        else:
+            out_rows.append(r)
+    if not replaced:
+        out_rows.append(new_row)
+
+    return sort_by_name_pinyin(out_rows, folder_attr="folder")
+
+
+def save_rows(
+    rows: list[GradeRow],
+    output: Path,
+    submissions: Optional[Path] = None,
+    avoid_overwrite: bool = False,
+) -> Path:
+    """保存成绩（含复核改分后回写）。可选附带最新预检。"""
+    precheck = None
+    if submissions is not None and Path(submissions).is_dir():
+        try:
+            precheck = build_precheck(discover_students(Path(submissions)))
+        except Exception:
+            precheck = None
+    out = Path(output)
+    if avoid_overwrite:
+        out = unique_output_path(out)
+    write_excel(rows, out, precheck=precheck)
+    return out
 
 
 def self_check():
@@ -1756,6 +2230,16 @@ def main():
         action="store_true",
         help="强制使用命令行（默认双击 exe 走图形界面）",
     )
+    parser.add_argument(
+        "--precheck",
+        action="store_true",
+        help="只做提交预检（缺题/快捷方式等），不写成绩、不改分",
+    )
+    parser.add_argument(
+        "--allow-overwrite",
+        action="store_true",
+        help="允许覆盖已存在的成绩表（默认自动换带时间戳的新文件名）",
+    )
     args = parser.parse_args()
     global _NO_PAUSE
     _NO_PAUSE = bool(args.no_pause)
@@ -1795,7 +2279,22 @@ def main():
         if not submissions.exists():
             raise FileNotFoundError(f"学生提交目录不存在：{submissions}")
 
-        output = args.output or (app_dir() / "成绩表.xlsx")
+        if args.precheck:
+            _students, pre = precheck_submissions(submissions)
+            print(f"提交目录：{submissions}")
+            print(f"预检人数：{len(pre)}")
+            bad = [p for p in pre if not p.can_grade]
+            warn = [p for p in pre if p.can_grade and p.status != "可批改"]
+            print(f"可批改：{sum(1 for p in pre if p.status == '可批改')}")
+            print(f"部分问题：{len(warn)}")
+            print(f"无法批改：{len(bad)}")
+            for p in pre:
+                if p.status != "可批改":
+                    print(f"  · {p.folder} | {p.status} | {p.issues}")
+            print("预检完成（未写成绩表）。")
+            return
+
+        output = args.output or suggest_output_path(app_dir())
         if args.no_class:
             class_name: Optional[str] = ""
         elif args.class_name is not None:
@@ -1815,19 +2314,28 @@ def main():
             self_check()
             print("-" * 50)
 
-        rows = grade_all(submissions, output, class_name=class_name)
+        rows = grade_all(
+            submissions,
+            output,
+            class_name=class_name,
+            avoid_overwrite=not args.allow_overwrite,
+        )
+        real_out = getattr(grade_all, "last_output", output)
         used_class = rows[0].class_name if rows else ""
         print(
             f"班级栏实际填写：{used_class if used_class else '（空，未能从文件夹名识别）'}"
         )
-        print(f"已批改 {len(rows)} 人，输出: {output}")
-        totals = [r.total for r in rows]
+        print(f"已批改 {len(rows)} 人，输出: {real_out}")
+        totals = [r.effective_total() for r in rows]
         if totals:
             print(
                 f"总分: 平均{sum(totals)/len(totals):.1f} "
                 f"最高{max(totals)} 最低{min(totals)}"
             )
-        print("完成。请打开 Excel 查看「备注」列了解扣分原因。")
+        stats = deduction_stats(rows)[:5]
+        if stats:
+            print("高频未满分：", "；".join(f"{a}×{b}" for a, b, _ in stats))
+        print("完成。请打开 Excel 查看「成绩表 / 预检报告 / 学情统计 / 教务简表」。")
     except Exception as e:
         print(f"\n出错了：{e}")
         raise
