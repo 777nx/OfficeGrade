@@ -2,6 +2,9 @@
 """
 Word 操作题自动批改 — 图形界面
 作者：Fantasy
+
+视觉：中国试卷「装订线」构图——左侧朱红装订边 + 卷面纸白，
+禁止蓝紫渐变；不用 SaaS 卡片堆叠。
 """
 from __future__ import annotations
 
@@ -19,6 +22,9 @@ from tkinter import (
     RIGHT,
     WORD,
     BooleanVar,
+    Canvas,
+    Frame,
+    Label,
     StringVar,
     Tk,
     filedialog,
@@ -43,36 +49,58 @@ from grade_exam import (  # noqa: E402
 )
 
 
-# 视觉：粉笔黑板感的教务工具，避开默认紫/奶油模板
-COLORS = {
-    "bg": "#1B2A2F",
-    "panel": "#243B42",
-    "card": "#2E4A52",
-    "accent": "#E8A87C",
-    "accent2": "#6BBFBF",
-    "text": "#F4F1EC",
-    "muted": "#A8B5B8",
-    "ok": "#7DCEA0",
-    "err": "#E08A8A",
-    "input_bg": "#152226",
+# —— 设计令牌：教务室试卷，非通用仪表盘 ——
+# paper 略偏冷灰绿，避开奶油 #F4F1EA；朱砂红作装订线，无蓝紫
+C = {
+    "desk": "#C8CFC2",  # 课桌贴面
+    "paper": "#F1F0EA",  # 卷面
+    "rule": "#D8D6CE",  # 细线
+    "margin": "#B42318",  # 装订线朱红
+    "margin_dark": "#8F1A12",
+    "ink": "#1A1916",
+    "muted": "#6E7168",
+    "field": "#FFFFFF",
+    "ok": "#2A6B4E",
+    "warn": "#9A5B12",
+    "err": "#B42318",
+    "log_bg": "#EAE8E0",
+    "log_fg": "#2A2E28",
 }
+
+
+def _pick_font(candidates: list[tuple], size: int, weight: str = "normal"):
+    """按系统可用字体择优。"""
+    # tk 字体名在运行时再绑定；此处仅返回元组，由调用方使用
+    name = candidates[0]
+    if weight == "bold":
+        return (name, size, "bold")
+    return (name, size)
 
 
 class GradeApp:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title(f"{APP_TITLE}  ·  {AUTHOR}")
-        self.root.geometry("820x640")
-        self.root.minsize(720, 560)
-        self.root.configure(bg=COLORS["bg"])
+        # 默认高度需盖住表单 +「批改记录」可见区域（高 DPI 下内容更高）
+        self.root.geometry("920x860")
+        self.root.minsize(800, 760)
+        self.root.configure(bg=C["desk"])
 
         self.submissions = StringVar(value="")
         self.output = StringVar(value=str(app_dir() / "成绩表.xlsx"))
-        self.class_mode = StringVar(value="auto")  # auto / empty / custom
+        self.class_mode = StringVar(value="auto")
         self.class_custom = StringVar(value="")
         self.skip_self_check = BooleanVar(value=False)
         self.busy = False
         self.last_output: Path | None = None
+
+        # 字体：标题用宋体（试卷抬头感），正文雅黑，日志等宽
+        self.font_brand = _pick_font(["华文中宋", "STZhongsong", "SimSun", "宋体"], 22, "bold")
+        self.font_brand_fallback = ("SimSun", 20, "bold")
+        self.font_ui = ("Microsoft YaHei UI", 10)
+        self.font_small = ("Microsoft YaHei UI", 9)
+        self.font_btn = ("Microsoft YaHei UI", 11, "bold")
+        self.font_mono = ("Consolas", 9)
 
         self._setup_style()
         self._build()
@@ -83,198 +111,342 @@ class GradeApp:
             style.theme_use("clam")
         except Exception:
             pass
-        font_ui = ("Microsoft YaHei UI", 10)
-        font_title = ("Microsoft YaHei UI", 18, "bold")
-        self.font_ui = font_ui
-        self.font_title = font_title
-        self.font_mono = ("Consolas", 9)
 
-        style.configure("TFrame", background=COLORS["bg"])
-        style.configure("Card.TFrame", background=COLORS["panel"])
+        style.configure("Paper.TFrame", background=C["paper"])
+        style.configure("Desk.TFrame", background=C["desk"])
         style.configure(
-            "Title.TLabel",
-            background=COLORS["bg"],
-            foreground=COLORS["text"],
-            font=font_title,
-        )
-        style.configure(
-            "Sub.TLabel",
-            background=COLORS["bg"],
-            foreground=COLORS["muted"],
-            font=("Microsoft YaHei UI", 10),
-        )
-        style.configure(
-            "Card.TLabel",
-            background=COLORS["panel"],
-            foreground=COLORS["text"],
-            font=font_ui,
+            "Ink.TLabel",
+            background=C["paper"],
+            foreground=C["ink"],
+            font=self.font_ui,
         )
         style.configure(
             "Muted.TLabel",
-            background=COLORS["panel"],
-            foreground=COLORS["muted"],
-            font=("Microsoft YaHei UI", 9),
+            background=C["paper"],
+            foreground=C["muted"],
+            font=self.font_small,
         )
         style.configure(
-            "Accent.TButton",
-            font=("Microsoft YaHei UI", 11, "bold"),
-            padding=(16, 8),
-        )
-        style.configure("TButton", font=font_ui, padding=(10, 6))
-        style.configure(
-            "TRadiobutton",
-            background=COLORS["panel"],
-            foreground=COLORS["text"],
-            font=font_ui,
+            "Field.TEntry",
+            fieldbackground=C["field"],
+            foreground=C["ink"],
+            insertcolor=C["ink"],
+            bordercolor=C["rule"],
+            lightcolor=C["rule"],
+            darkcolor=C["rule"],
+            padding=6,
         )
         style.configure(
-            "TCheckbutton",
-            background=COLORS["panel"],
-            foreground=COLORS["text"],
-            font=font_ui,
+            "Grade.TRadiobutton",
+            background=C["paper"],
+            foreground=C["ink"],
+            font=self.font_ui,
+            focuscolor=C["paper"],
+        )
+        style.configure(
+            "Grade.TCheckbutton",
+            background=C["paper"],
+            foreground=C["ink"],
+            font=self.font_ui,
+            focuscolor=C["paper"],
         )
         style.map(
-            "TRadiobutton",
-            background=[("active", COLORS["panel"])],
-            foreground=[("active", COLORS["text"])],
+            "Grade.TRadiobutton",
+            background=[("active", C["paper"])],
+            foreground=[("active", C["ink"])],
         )
         style.map(
-            "TCheckbutton",
-            background=[("active", COLORS["panel"])],
-            foreground=[("active", COLORS["text"])],
+            "Grade.TCheckbutton",
+            background=[("active", C["paper"])],
+            foreground=[("active", C["ink"])],
+        )
+        style.configure(
+            "Ghost.TButton",
+            font=self.font_ui,
+            padding=(12, 6),
+            background=C["paper"],
+            foreground=C["ink"],
+        )
+        style.configure(
+            "Run.TButton",
+            font=self.font_btn,
+            padding=(22, 10),
+            background=C["margin"],
+            foreground="#FFFFFF",
+            borderwidth=0,
+        )
+        style.map(
+            "Run.TButton",
+            background=[
+                ("active", C["margin_dark"]),
+                ("disabled", "#C9A8A4"),
+            ],
+            foreground=[("disabled", "#F5EDEC")],
+        )
+        style.map(
+            "Ghost.TButton",
+            background=[("active", C["rule"]), ("disabled", C["paper"])],
         )
 
     def _build(self):
-        pad = {"padx": 20, "pady": 8}
+        outer = Frame(self.root, bg=C["desk"])
+        outer.pack(fill=BOTH, expand=True, padx=18, pady=18)
 
-        head = ttk.Frame(self.root, style="TFrame")
-        head.pack(fill="x", **pad)
-        ttk.Label(head, text=APP_TITLE, style="Title.TLabel").pack(anchor="w")
-        ttk.Label(
+        # 整张「试卷」：左装订线 + 右卷面（单一构图）
+        sheet = Frame(outer, bg=C["paper"], highlightthickness=0)
+        sheet.pack(fill=BOTH, expand=True)
+
+        # 左侧装订线（唯一强视觉锚点）
+        bind = Canvas(sheet, width=36, bg=C["margin"], highlightthickness=0, bd=0)
+        bind.pack(side=LEFT, fill="y")
+        bind.bind("<Configure>", lambda e: self._draw_binding(bind, e.height))
+
+        body = Frame(sheet, bg=C["paper"])
+        body.pack(side=LEFT, fill=BOTH, expand=True)
+        # 用 grid：日志行独占剩余高度，避免默认窗口把记录区挤成一条线
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(5, weight=1, minsize=180)
+
+        # —— 卷首：品牌即主角 ——
+        head = Frame(body, bg=C["paper"])
+        head.grid(row=0, column=0, sticky="ew", padx=28, pady=(16, 4))
+
+        brand = Label(
             head,
-            text=f"作者 {AUTHOR}  ·  支持 .docx / .doc  ·  自动生成 Excel 成绩表",
-            style="Sub.TLabel",
+            text="OfficeGrade",
+            bg=C["paper"],
+            fg=C["ink"],
+            font=self.font_brand,
+            anchor="w",
+        )
+        brand.pack(anchor="w")
+        try:
+            brand.configure(font=self.font_brand)
+        except Exception:
+            brand.configure(font=self.font_brand_fallback)
+
+        Label(
+            head,
+            text="把学生作业总文件夹选好，一键批改打字、简历表和命名，导出 Excel。",
+            bg=C["paper"],
+            fg=C["muted"],
+            font=self.font_ui,
+            anchor="w",
+            justify=LEFT,
+            wraplength=720,
         ).pack(anchor="w", pady=(4, 0))
 
-        card = ttk.Frame(self.root, style="Card.TFrame")
-        card.pack(fill="x", padx=20, pady=6)
+        Label(
+            head,
+            text=f"作者 {AUTHOR}　　支持 .docx / .doc",
+            bg=C["paper"],
+            fg=C["muted"],
+            font=self.font_small,
+            anchor="w",
+        ).pack(anchor="w", pady=(2, 0))
 
-        # 提交目录
-        row1 = ttk.Frame(card, style="Card.TFrame")
-        row1.pack(fill="x", padx=16, pady=(14, 6))
-        ttk.Label(row1, text="学生作业文件夹", style="Card.TLabel").pack(anchor="w")
-        ttk.Label(
-            row1,
-            text="选「一人一个子文件夹」的总目录",
-            style="Muted.TLabel",
-        ).pack(anchor="w")
-        r1b = ttk.Frame(card, style="Card.TFrame")
-        r1b.pack(fill="x", padx=16, pady=(0, 10))
-        self._entry(r1b, self.submissions).pack(side=LEFT, fill="x", expand=True)
-        ttk.Button(r1b, text="浏览…", command=self._browse_submissions).pack(
-            side=RIGHT, padx=(8, 0)
+        Canvas(body, height=1, bg=C["rule"], highlightthickness=0, bd=0).grid(
+            row=1, column=0, sticky="ew", padx=28, pady=(8, 6)
         )
 
-        # 输出
-        row2 = ttk.Frame(card, style="Card.TFrame")
-        row2.pack(fill="x", padx=16, pady=(6, 6))
-        ttk.Label(row2, text="成绩表保存为", style="Card.TLabel").pack(anchor="w")
-        r2b = ttk.Frame(card, style="Card.TFrame")
-        r2b.pack(fill="x", padx=16, pady=(0, 10))
-        self._entry(r2b, self.output).pack(side=LEFT, fill="x", expand=True)
-        ttk.Button(r2b, text="浏览…", command=self._browse_output).pack(
-            side=RIGHT, padx=(8, 0)
+        form = Frame(body, bg=C["paper"])
+        form.grid(row=2, column=0, sticky="ew", padx=28)
+
+        self._field_block(
+            form,
+            "学生作业文件夹",
+            "选「一人一个子文件夹」的总目录",
+            self.submissions,
+            self._browse_submissions,
+        )
+        self._field_block(
+            form,
+            "成绩表保存为",
+            None,
+            self.output,
+            self._browse_output,
         )
 
-        # 班级
-        row3 = ttk.Frame(card, style="Card.TFrame")
-        row3.pack(fill="x", padx=16, pady=(6, 4))
-        ttk.Label(row3, text="成绩单「班级」列", style="Card.TLabel").pack(anchor="w")
-        r3b = ttk.Frame(card, style="Card.TFrame")
-        r3b.pack(fill="x", padx=16, pady=(0, 4))
+        Label(
+            form, text="成绩单「班级」列", bg=C["paper"], fg=C["ink"], font=self.font_ui
+        ).pack(anchor="w", pady=(6, 2))
+        opts = Frame(form, bg=C["paper"])
+        opts.pack(fill="x")
         ttk.Radiobutton(
-            r3b,
+            opts,
             text="自动（文件夹名里出现最多的班级）",
             variable=self.class_mode,
             value="auto",
             command=self._toggle_class,
+            style="Grade.TRadiobutton",
         ).pack(anchor="w")
         ttk.Radiobutton(
-            r3b,
+            opts,
             text="留空",
             variable=self.class_mode,
             value="empty",
             command=self._toggle_class,
+            style="Grade.TRadiobutton",
         ).pack(anchor="w")
-        r3c = ttk.Frame(card, style="Card.TFrame")
-        r3c.pack(fill="x", padx=16, pady=(0, 8))
+
+        custom_row = Frame(form, bg=C["paper"])
+        custom_row.pack(fill="x", pady=(2, 0))
         ttk.Radiobutton(
-            r3c,
-            text="指定：",
+            custom_row,
+            text="指定",
             variable=self.class_mode,
             value="custom",
             command=self._toggle_class,
+            style="Grade.TRadiobutton",
         ).pack(side=LEFT)
-        self.class_entry = self._entry(r3c, self.class_custom, width=36)
-        self.class_entry.pack(side=LEFT, padx=(4, 0))
-        ttk.Label(
-            card,
-            text="任课班参考：" + "、".join(TEACHER_CLASSES[:4]) + "…",
-            style="Muted.TLabel",
-        ).pack(anchor="w", padx=16, pady=(0, 8))
+        self.class_entry = ttk.Entry(
+            custom_row,
+            textvariable=self.class_custom,
+            font=self.font_ui,
+            style="Field.TEntry",
+            width=34,
+        )
+        self.class_entry.pack(side=LEFT, padx=(8, 0))
 
-        row4 = ttk.Frame(card, style="Card.TFrame")
-        row4.pack(fill="x", padx=16, pady=(0, 14))
+        Label(
+            form,
+            text="任课班参考：" + "、".join(TEACHER_CLASSES[:4]) + "…",
+            bg=C["paper"],
+            fg=C["muted"],
+            font=self.font_small,
+            anchor="w",
+        ).pack(anchor="w", pady=(4, 0))
+
         ttk.Checkbutton(
-            row4,
+            form,
             text="跳过答案自检（加快速度）",
             variable=self.skip_self_check,
-        ).pack(side=LEFT)
+            style="Grade.TCheckbutton",
+        ).pack(anchor="w", pady=(4, 0))
 
-        # 按钮区
-        actions = ttk.Frame(self.root, style="TFrame")
-        actions.pack(fill="x", padx=20, pady=10)
+        actions = Frame(body, bg=C["paper"])
+        actions.grid(row=3, column=0, sticky="ew", padx=28, pady=(12, 6))
+
         self.btn_run = ttk.Button(
-            actions, text="开始批改", style="Accent.TButton", command=self._start
+            actions, text="开始批改", style="Run.TButton", command=self._start
         )
         self.btn_run.pack(side=LEFT)
+
         self.btn_open = ttk.Button(
-            actions, text="打开成绩表", command=self._open_excel, state=DISABLED
+            actions,
+            text="打开成绩表",
+            style="Ghost.TButton",
+            command=self._open_excel,
+            state=DISABLED,
         )
         self.btn_open.pack(side=LEFT, padx=(10, 0))
         self.btn_folder = ttk.Button(
-            actions, text="打开输出目录", command=self._open_outdir, state=DISABLED
+            actions,
+            text="打开输出目录",
+            style="Ghost.TButton",
+            command=self._open_outdir,
+            state=DISABLED,
         )
-        self.btn_folder.pack(side=LEFT, padx=(10, 0))
-        self.status = ttk.Label(actions, text="就绪", style="Sub.TLabel")
+        self.btn_folder.pack(side=LEFT, padx=(8, 0))
+
+        self.status = Label(
+            actions,
+            text="就绪",
+            bg=C["paper"],
+            fg=C["muted"],
+            font=self.font_ui,
+        )
         self.status.pack(side=RIGHT)
 
-        # 日志
-        log_frame = ttk.Frame(self.root, style="Card.TFrame")
-        log_frame.pack(fill=BOTH, expand=True, padx=20, pady=(0, 16))
-        ttk.Label(log_frame, text="运行日志", style="Card.TLabel").pack(
-            anchor="w", padx=12, pady=(10, 4)
+        Canvas(body, height=1, bg=C["rule"], highlightthickness=0, bd=0).grid(
+            row=4, column=0, sticky="ew", padx=28, pady=(2, 4)
         )
+
+        log_wrap = Frame(body, bg=C["paper"])
+        log_wrap.grid(row=5, column=0, sticky="nsew", padx=28, pady=(0, 14))
+        log_wrap.rowconfigure(1, weight=1)
+        log_wrap.columnconfigure(0, weight=1)
+        Label(
+            log_wrap,
+            text="批改记录",
+            bg=C["paper"],
+            fg=C["ink"],
+            font=self.font_ui,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+
         self.log = ScrolledText(
-            log_frame,
-            height=16,
+            log_wrap,
+            height=10,
             wrap=WORD,
             font=self.font_mono,
-            bg=COLORS["input_bg"],
-            fg=COLORS["text"],
-            insertbackground=COLORS["text"],
+            bg=C["log_bg"],
+            fg=C["log_fg"],
+            insertbackground=C["ink"],
             relief="flat",
             borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=C["rule"],
+            highlightcolor=C["margin"],
+            padx=10,
+            pady=8,
         )
-        self.log.pack(fill=BOTH, expand=True, padx=12, pady=(0, 12))
+        self.log.grid(row=1, column=0, sticky="nsew")
         self._log(f"{APP_TITLE}\n作者：{AUTHOR}\n程序目录：{app_dir()}\n")
         self._toggle_class()
+        self.root.after_idle(self._ensure_log_visible)
 
-    def _entry(self, parent, var: StringVar, width: int | None = None):
-        e = ttk.Entry(parent, textvariable=var, font=self.font_ui)
-        if width:
-            e.configure(width=width)
-        return e
+    def _ensure_log_visible(self):
+        """按内容需求抬高窗口，保证批改记录区至少约 180px 可见。"""
+        self.root.update_idletasks()
+        need_h = max(860, self.root.winfo_reqheight() + 24)
+        cur_w = max(self.root.winfo_width(), 920)
+        # 不超过工作区高度的 92%
+        try:
+            sw = self.root.winfo_screenheight()
+            need_h = min(need_h, int(sw * 0.92))
+        except Exception:
+            pass
+        if self.root.winfo_height() < need_h - 8:
+            self.root.geometry(f"{cur_w}x{need_h}")
+
+    def _draw_binding(self, canvas: Canvas, height: int):
+        canvas.delete("all")
+        w = int(canvas["width"])
+        canvas.create_rectangle(0, 0, w, height, fill=C["margin"], outline="")
+        # 装订孔：卷面记忆点
+        y = 28
+        while y < height - 20:
+            canvas.create_oval(
+                11, y, 25, y + 14, fill=C["margin_dark"], outline=C["margin_dark"]
+            )
+            canvas.create_oval(13, y + 2, 23, y + 12, fill=C["paper"], outline="")
+            y += 48
+        # 竖排小字
+        canvas.create_text(
+            w // 2,
+            min(height - 40, height // 2 + 120),
+            text="装\n订\n线",
+            fill="#F7D4CF",
+            font=("Microsoft YaHei UI", 8),
+            justify="center",
+        )
+
+    def _field_block(self, parent, title, hint, var, browse_cmd):
+        Label(parent, text=title, bg=C["paper"], fg=C["ink"], font=self.font_ui).pack(
+            anchor="w", pady=(4, 1)
+        )
+        if hint:
+            Label(
+                parent, text=hint, bg=C["paper"], fg=C["muted"], font=self.font_small
+            ).pack(anchor="w")
+        row = Frame(parent, bg=C["paper"])
+        row.pack(fill="x", pady=(2, 0))
+        entry = ttk.Entry(row, textvariable=var, font=self.font_ui, style="Field.TEntry")
+        entry.pack(side=LEFT, fill="x", expand=True)
+        ttk.Button(row, text="浏览", style="Ghost.TButton", command=browse_cmd).pack(
+            side=RIGHT, padx=(8, 0)
+        )
 
     def _toggle_class(self):
         state = NORMAL if self.class_mode.get() == "custom" else DISABLED
@@ -305,8 +477,9 @@ class GradeApp:
         self.log.see(END)
         self.log.configure(state=DISABLED)
 
-    def _set_status(self, text: str):
-        self.status.configure(text=text)
+    def _set_status(self, text: str, tone: str = "muted"):
+        color = {"ok": C["ok"], "err": C["err"], "warn": C["warn"]}.get(tone, C["muted"])
+        self.status.configure(text=text, fg=color)
 
     def _start(self):
         if self.busy:
@@ -335,8 +508,8 @@ class GradeApp:
         self.btn_run.configure(state=DISABLED)
         self.btn_open.configure(state=DISABLED)
         self.btn_folder.configure(state=DISABLED)
-        self._set_status("批改中…")
-        self._log("\n" + "=" * 40)
+        self._set_status("批改中…", "warn")
+        self._log("\n" + "—" * 36)
         self._log(f"提交目录：{sub}")
         self._log(f"输出文件：{out}")
         if class_name is None:
@@ -350,7 +523,6 @@ class GradeApp:
             try:
                 if not skip:
                     self.root.after(0, lambda: self._log("正在自检标准答案…"))
-                    # self_check 用 print，这里直接调并捕获异常
                     self_check()
                     self.root.after(0, lambda: self._log("自检通过。"))
 
@@ -364,7 +536,7 @@ class GradeApp:
                     self.root.after(
                         0,
                         lambda i=i, total=total: self._set_status(
-                            f"批改中 {i}/{total}"
+                            f"批改中 {i}/{total}", "warn"
                         ),
                     )
 
@@ -397,14 +569,14 @@ class GradeApp:
         self.btn_folder.configure(state=NORMAL)
         self.last_output = out
         self._log(summary)
-        self._set_status("完成")
+        self._set_status("完成", "ok")
         messagebox.showinfo("批改完成", summary)
 
     def _done_err(self, err: str):
         self.busy = False
         self.btn_run.configure(state=NORMAL)
         self._log("出错了：\n" + err)
-        self._set_status("出错")
+        self._set_status("出错", "err")
         messagebox.showerror("批改失败", err[:800])
 
     def _open_excel(self):
@@ -423,7 +595,6 @@ class GradeApp:
 
 def run_gui():
     root = Tk()
-    # Windows 高 DPI
     try:
         from ctypes import windll
 
