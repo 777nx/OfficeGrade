@@ -436,21 +436,58 @@ class GradeApp:
         self.log.grid(row=1, column=0, sticky="nsew")
         self._log(f"{APP_TITLE}\n作者：{AUTHOR}\n程序目录：{app_dir()}\n")
         self._toggle_class()
-        self.root.after_idle(self._ensure_log_visible)
+        self.root.after_idle(self._place_on_screen)
 
-    def _ensure_log_visible(self):
-        """按内容需求抬高窗口，保证批改记录区至少约 180px 可见。"""
-        self.root.update_idletasks()
-        need_h = max(860, self.root.winfo_reqheight() + 24)
-        cur_w = max(self.root.winfo_width(), 920)
-        # 不超过工作区高度的 92%
+    def _work_area(self) -> tuple[int, int, int, int]:
+        """返回主显示器工作区 (left, top, width, height)，已扣除任务栏。"""
         try:
-            sw = self.root.winfo_screenheight()
-            need_h = min(need_h, int(sw * 0.92))
+            from ctypes import byref, windll, wintypes
+
+            rect = wintypes.RECT()
+            # SPI_GETWORKAREA = 0x0030；必须 byref，否则可能得到空矩形
+            ok = windll.user32.SystemParametersInfoW(0x0030, 0, byref(rect), 0)
+            if ok:
+                w = int(rect.right - rect.left)
+                h = int(rect.bottom - rect.top)
+                if w >= 400 and h >= 300:
+                    return int(rect.left), int(rect.top), w, h
         except Exception:
             pass
-        if self.root.winfo_height() < need_h - 8:
-            self.root.geometry(f"{cur_w}x{need_h}")
+        sw = max(self.root.winfo_screenwidth(), 800)
+        sh = max(self.root.winfo_screenheight(), 600)
+        return 0, 0, sw, sh
+
+    def _place_on_screen(self):
+        """按内容抬高窗口，并居中到工作区内，避免启动时贴边/被任务栏遮挡。"""
+        self.root.update_idletasks()
+        left, top, work_w, work_h = self._work_area()
+        if work_w < 400 or work_h < 300:
+            left, top, work_w, work_h = 0, 0, 1280, 800
+
+        margin = 24
+        max_w = max(640, work_w - margin * 2)
+        max_h = max(560, work_h - margin * 2)
+
+        need_w = min(max(self.root.winfo_reqwidth(), 920), max_w)
+        need_h = min(max(860, self.root.winfo_reqheight() + 24), max_h)
+        need_h = max(min(need_h, max_h), min(760, max_h))
+        need_w = max(min(need_w, max_w), min(800, max_w))
+
+        x = left + max(0, (work_w - need_w) // 2)
+        y = top + max(0, (work_h - need_h) // 2)
+        # 保证标题栏落在工作区内
+        max_x = left + max(0, work_w - need_w)
+        max_y = top + max(0, work_h - need_h)
+        x = min(max(x, left), max_x)
+        y = min(max(y, top), max_y)
+        self.root.geometry(f"{need_w}x{need_h}+{x}+{y}")
+        self.root.minsize(min(800, max_w), min(760, max_h))
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
 
     def _draw_binding(self, canvas: Canvas, height: int):
         canvas.delete("all")
