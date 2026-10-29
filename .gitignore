@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# PyInstaller / 打包产物
+build/
+dist/
+*.exe
+release/
+
+# 本地批改数据与临时文件
+成绩表*.xlsx
+*_扣分说明.xlsx
+OfficeGrade_doc_cache/
+_test_doc/
+_ans_smoke/
+_exe_smoke/
+~$*
+
+# 学生提交（体积大、含隐私，不入库）
+26*期中考试/
+*期中考试/
+*作业/
+
+# 含真实校名/未脱敏原稿（仅本机保留）
+local_sensitive/
+*.原版.docx
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
