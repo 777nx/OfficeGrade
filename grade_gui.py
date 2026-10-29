@@ -583,13 +583,30 @@ class GradeApp:
             sub = sub.resolve(strict=False)
         except Exception:
             pass
-        out = Path(self.output.get().strip().strip('"'))
+        raw_out = self.output.get().strip().strip('"')
+        if not raw_out or raw_out in {".", "./", ".\\"}:
+            messagebox.showwarning(
+                "提示", "请填写成绩表保存路径，或点右侧「浏览」选择保存位置。"
+            )
+            return
+        out = Path(raw_out).expanduser()
+        try:
+            out = out.resolve(strict=False)
+        except Exception:
+            pass
+        if out.exists() and out.is_dir():
+            out = out / "成绩表.xlsx"
+        if out.suffix.lower() not in {".xlsx", ".xlsm"}:
+            messagebox.showwarning("提示", "成绩表请保存为 .xlsx 文件。")
+            return
         if not sub.exists() or not sub.is_dir():
             messagebox.showwarning("提示", "请先选择有效的学生作业文件夹。")
             return
-        if not out.parent.exists():
-            messagebox.showwarning("提示", "成绩表保存目录不存在。")
+        if out.parent == out or not out.parent.exists():
+            messagebox.showwarning("提示", "成绩表保存目录不存在，请重新选择保存位置。")
             return
+        # 同步回界面，避免空路径再次触发
+        self.output.set(str(out))
 
         mode = self.class_mode.get()
         if mode == "empty":
@@ -655,10 +672,29 @@ class GradeApp:
                     )
                 self.root.after(0, lambda: self._done_ok(out, summary))
             except Exception as e:
-                err = f"{e}\n{traceback.format_exc()}"
-                self.root.after(0, lambda: self._done_err(err))
+                detail = traceback.format_exc()
+                user_msg = self._friendly_error(e)
+                self.root.after(
+                    0, lambda user_msg=user_msg, detail=detail: self._done_err(user_msg, detail)
+                )
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _friendly_error(self, e: BaseException) -> str:
+        """给教师看的短说明；技术堆栈只写进批改记录。"""
+        if isinstance(e, PermissionError):
+            return (
+                "无法写入成绩表。\n"
+                "请确认保存路径有效，且该 Excel 没有正在被打开。"
+            )
+        if isinstance(e, FileNotFoundError):
+            return str(e) or "找不到需要的文件或文件夹。"
+        if isinstance(e, OSError):
+            return f"保存或读取文件时出错：{e}"
+        msg = str(e).strip()
+        if msg:
+            return f"批改未能完成：{msg}"
+        return "批改未能完成，请查看下方「批改记录」。"
 
     def _done_ok(self, out: Path, summary: str):
         self.busy = False
@@ -670,12 +706,15 @@ class GradeApp:
         self._set_status("完成", "ok")
         messagebox.showinfo("批改完成", summary)
 
-    def _done_err(self, err: str):
+    def _done_err(self, user_msg: str, detail: str = ""):
         self.busy = False
         self.btn_run.configure(state=NORMAL)
-        self._log("出错了：\n" + err)
+        if detail:
+            self._log("出错了：\n" + detail)
+        else:
+            self._log("出错了：\n" + user_msg)
         self._set_status("出错", "err")
-        messagebox.showerror("批改失败", err[:800])
+        messagebox.showerror("批改失败", user_msg)
 
     def _open_excel(self):
         path = self.last_output or Path(self.output.get())
