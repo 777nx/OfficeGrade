@@ -573,7 +573,16 @@ class GradeApp:
     def _start(self):
         if self.busy:
             return
-        sub = Path(self.submissions.get().strip().strip('"'))
+        raw_sub = self.submissions.get().strip().strip('"')
+        # Path("") 在 Windows 上等于「当前目录」，会误批 release/答案
+        if not raw_sub or raw_sub in {".", "./", ".\\"}:
+            messagebox.showwarning("提示", "请先选择学生作业文件夹（浏览选「一人一个子文件夹」的总目录）。")
+            return
+        sub = Path(raw_sub).expanduser()
+        try:
+            sub = sub.resolve(strict=False)
+        except Exception:
+            pass
         out = Path(self.output.get().strip().strip('"'))
         if not sub.exists() or not sub.is_dir():
             messagebox.showwarning("提示", "请先选择有效的学生作业文件夹。")

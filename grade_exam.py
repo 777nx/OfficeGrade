@@ -59,7 +59,18 @@ DEFAULT_CLASS_NAME = ""
 AUTHOR = "Fantasy"
 APP_TITLE = "Word 操作题自动批改"
 # 列举文件夹时忽略这些名字
-_SKIP_DIR_NAMES = {"答案", "dist", "build", "release", "__pycache__"}
+_SKIP_DIR_NAMES = {
+    "答案",
+    "assets",
+    "dist",
+    "build",
+    "release",
+    "local_sensitive",
+    "__pycache__",
+    ".git",
+    ".idea",
+    ".vscode",
+}
 
 # 试卷分值
 SCORE_TYPING_COMPLETE = 20.0
@@ -690,11 +701,11 @@ def pick_best(files: list[Path], kind: str) -> Optional[Path]:
 def discover_students(submissions: Path) -> list[StudentWork]:
     students: list[StudentWork] = []
 
-    # 子文件夹
+    # 子文件夹（跳过答案、打包与工程目录，避免误批）
     for d in sorted(submissions.iterdir()):
         if not d.is_dir():
             continue
-        if d.name.startswith("."):
+        if d.name.startswith(".") or d.name in _SKIP_DIR_NAMES:
             continue
         sw = StudentWork(folder_name=d.name, folder_path=d)
         sw.class_name, sw.student_name = parse_folder_identity(d.name)
@@ -1544,6 +1555,11 @@ def grade_all(
     answer_text = para_full_text(answer_doc)
 
     students = discover_students(submissions)
+    if not students:
+        raise FileNotFoundError(
+            f"在「{submissions}」下没有找到可批改的学生文件夹。\n"
+            "请选择「一人一个子文件夹」的作业总目录（不要选程序自带的答案目录）。"
+        )
     if class_name is None:
         class_name = most_common_class(students)
     rows: list[GradeRow] = []
