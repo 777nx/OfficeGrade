@@ -20,6 +20,7 @@ OfficeGrade_doc_cache/
 _test_doc/
 _ans_smoke/
 _exe_smoke/
+_icon_extract/
 ~$*
 
 # 学生提交（体积大、含隐私，不入库）

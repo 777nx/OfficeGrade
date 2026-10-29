@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('答案/打字测试.docx', '答案'), ('答案/简历表.docx', '答案'), ('评分标准.md', '.')]
+datas = [('答案/打字测试.docx', '答案'), ('答案/简历表.docx', '答案'), ('评分标准.md', '.'), ('assets/app.ico', 'assets'), ('assets/app_icon.png', 'assets'), ('assets/app_icon_64.png', 'assets')]
 binaries = []
 hiddenimports = ['docx', 'openpyxl', 'grade_exam', 'grade_gui']
 tmp_ret = collect_all('pypinyin')
@@ -43,4 +43,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version='version_info.txt',
+    icon=['assets/app.ico'],
 )

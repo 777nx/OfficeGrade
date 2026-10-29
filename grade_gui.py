@@ -25,6 +25,7 @@ from tkinter import (
     Canvas,
     Frame,
     Label,
+    PhotoImage,
     StringVar,
     Tk,
     filedialog,
@@ -45,6 +46,7 @@ from grade_exam import (  # noqa: E402
     TEACHER_CLASSES,
     app_dir,
     grade_all,
+    resource_dir,
     self_check,
 )
 
@@ -103,7 +105,44 @@ class GradeApp:
         self.font_mono = ("Consolas", 9)
 
         self._setup_style()
+        self._apply_app_icon()
         self._build()
+
+    def _asset_paths(self, *relative: str) -> list[Path]:
+        rel = Path(*relative)
+        bases = [resource_dir(), app_dir(), Path(__file__).resolve().parent]
+        return [base / rel for base in bases]
+
+    def _first_existing(self, paths: list[Path]) -> Path | None:
+        for p in paths:
+            if p.exists():
+                return p
+        return None
+
+    def _apply_app_icon(self):
+        """窗口标题栏 / 任务栏图标。"""
+        self._icon_photos: list[PhotoImage] = []
+        ico = self._first_existing(self._asset_paths("assets", "app.ico"))
+        if ico is not None:
+            try:
+                self.root.iconbitmap(default=str(ico))
+            except Exception:
+                try:
+                    self.root.iconbitmap(str(ico))
+                except Exception:
+                    pass
+        # tk PhotoImage 对大图不稳定，优先 64px
+        png = self._first_existing(
+            self._asset_paths("assets", "app_icon_64.png")
+            + self._asset_paths("assets", "app_icon.png")
+        )
+        if png is not None:
+            try:
+                img = PhotoImage(file=str(png))
+                self.root.iconphoto(True, img)
+                self._icon_photos.append(img)
+            except Exception:
+                pass
 
     def _setup_style(self):
         style = ttk.Style()
@@ -307,6 +346,9 @@ class GradeApp:
             width=34,
         )
         self.class_entry.pack(side=LEFT, padx=(8, 0))
+        # 点输入框即切到「指定」并获焦（禁用态点不进，故未选中时用只读可点）
+        self.class_entry.bind("<Button-1>", self._activate_custom_class)
+        self.class_entry.bind("<FocusIn>", self._activate_custom_class)
 
         Label(
             form,
@@ -449,8 +491,18 @@ class GradeApp:
         )
 
     def _toggle_class(self):
-        state = NORMAL if self.class_mode.get() == "custom" else DISABLED
-        self.class_entry.configure(state=state)
+        # 未选「指定」时用 readonly：仍可点击获焦，但不能误改；选中后可编辑
+        if self.class_mode.get() == "custom":
+            self.class_entry.configure(state=NORMAL)
+        else:
+            self.class_entry.configure(state="readonly")
+
+    def _activate_custom_class(self, _event=None):
+        if self.class_mode.get() != "custom":
+            self.class_mode.set("custom")
+            self._toggle_class()
+        # 推迟获焦，避免与 readonly→normal 切换抢事件
+        self.root.after_idle(lambda: self.class_entry.focus_set())
 
     def _browse_submissions(self):
         path = filedialog.askdirectory(

@@ -8,10 +8,14 @@ python -m pip install -q pyinstaller pypinyin python-docx openpyxl
 echo [2/3] 开始打包 OfficeGrade.exe ...
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name OfficeGrade ^
+  --icon "assets\app.ico" ^
   --version-file version_info.txt ^
   --add-data "答案\打字测试.docx;答案" ^
   --add-data "答案\简历表.docx;答案" ^
   --add-data "评分标准.md;." ^
+  --add-data "assets\app.ico;assets" ^
+  --add-data "assets\app_icon.png;assets" ^
+  --add-data "assets\app_icon_64.png;assets" ^
   --collect-all pypinyin ^
   --hidden-import docx ^
   --hidden-import openpyxl ^
